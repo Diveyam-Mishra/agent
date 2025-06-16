@@ -1,31 +1,28 @@
-import sys, asyncio
+import os
+import sys
+import uuid
+import asyncio
+import logging
+import pandas as pd
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from asyncio import WindowsProactorEventLoopPolicy
-# Use ProactorEventLoopPolicy on Windows for full subprocess support
+from langchain_openai import ChatOpenAI
+from browser_use import BrowserSession, BrowserProfile, Agent
+import uvicorn
+
+# Windows-specific setup
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
-import pandas as pd
-from browser_use import BrowserSession, BrowserProfile, Agent
-from langchain_openai import ChatOpenAI
-from dotenv import load_dotenv
-import asyncio
-import logging
-import sys
-import uvicorn
-import uuid
-
-import asyncio
-
-
 load_dotenv()
-ALLOWED_ORIGINS = ["*"]
-app = FastAPI()
 
-# Add CORS middleware
+# FastAPI setup
+app = FastAPI()
+ALLOWED_ORIGINS = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -36,31 +33,57 @@ app.add_middleware(
 
 runners = {}  # session_id -> AgentRunner
 
+# --------- LOGGING SETUP ---------
+def get_logger(session_id: str) -> logging.Logger:
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{session_id}.log")
+
+    logger = logging.getLogger(session_id)
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        handler = logging.FileHandler(log_path)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger
+
+# --------- AGENT RUNNER ---------
 class AgentRunner:
-    def __init__(self, task_excel: str, conversation_path: str, browser_session):
+    def __init__(self, task_excel: str, conversation_path: str, browser_session, logger: logging.Logger):
         self.task_excel = task_excel
         self.conversation_path = conversation_path
         self.browser_session = browser_session
         self.queue = asyncio.Queue()
         self.done = False
+        self.logger = logger
 
     async def run(self):
-        # execute agent and push final result
-        result = await _run_agent(self.task_excel, self.conversation_path, self.browser_session)
-        await self.queue.put({"result": result})
-        self.done = True
+        self.logger.info("Agent run initiated.")
+        try:
+            result = await _run_agent(self.task_excel, self.conversation_path, self.browser_session, self.logger)
+            await self.queue.put({"result": result})
+            self.logger.info("Agent run completed successfully.")
+        except Exception as e:
+            self.logger.exception("Agent run failed.")
+            await self.queue.put({"error": str(e)})
+        finally:
+            self.done = True
 
     async def next_update(self):
         return await self.queue.get()
 
     async def control(self, msg: str):
-        # placeholder for pause/stop/resume handling
         pass
 
+# --------- SCHEMA ---------
 class StartRequest(BaseModel):
     task_excel: str
     conversation_path: str
 
+# --------- BROWSER SETUP ---------
 async def browser_profile_opening():
     browser_profile = BrowserProfile(
         headless=False,
@@ -73,21 +96,17 @@ async def browser_profile_opening():
         browser_binary_path="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         disable_security=True
     )
-
-    browser_session = BrowserSession(
-        browser_profile=browser_profile
-    )
+    browser_session = BrowserSession(browser_profile=browser_profile)
     await browser_session.start()
     return browser_session
 
-async def _run_agent(task_excel: str, conversation_path: str, browser_session: BrowserSession):
-
+# --------- AGENT EXECUTION ---------
+async def _run_agent(task_excel: str, conversation_path: str, browser_session: BrowserSession, logger: logging.Logger):
+    logger.info("Loading Excel task file.")
     task = pd.read_excel(task_excel)
+    logger.info("Setting up LLMs and agent.")
     llm = ChatOpenAI(model='gpt-4.1')
-    sensitive_data = {
-        'login_email': 'dmishra930@agentforce.com',
-        'login_password': 'Divey@m02'
-    }
+
     agent = Agent(
         task=task,
         save_conversation_path=conversation_path,
@@ -98,7 +117,10 @@ async def _run_agent(task_excel: str, conversation_path: str, browser_session: B
         use_vision=True,
         max_actions_per_step=5,
         max_input_tokens=136000,
-        sensitive_data=sensitive_data,
+        sensitive_data={
+            'login_email': 'dmishra930@agentforce.com',
+            'login_password': 'Divey@m02'
+        },
         task_id="1",
         extend_system_message="""
 You are a web automation agent that follows instructions with high precision. When navigating menus or clicking sidebar items, always prefer exact text matches over partial matches.
@@ -111,35 +133,26 @@ Skip any irrelevant or unfilled fields.
 DOM structure may change, so rely on text content, not HTML structure.
 If something is not visible, use "extract_content":"should_strip_link_urls":false to pull information.
 You don't have to fill every field in a form—only the ones shown or required.
-""",
-
+"""
     )
-    
+
+    logger.info("Executing agent task.")
     result = await agent.run()
     await agent.close()
+    logger.info("Agent task execution finished.")
     return result
 
-@app.post("/agent/create" )
-async def create_agent():
-    browser_session = await browser_profile_opening()
-    try:
-        result = await _run_agent(
-            task_excel="Book1.xlsx",
-            conversation_path="convo/conversation.txt",
-            browser_session=browser_session
-        )
-        return {"result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# --------- ROUTES ---------
 @app.post("/start")
 async def start_agent(req: StartRequest):
-    # initialize browser session
     browser_session = await browser_profile_opening()
     session_id = str(uuid.uuid4())
-    runner = AgentRunner(req.task_excel, req.conversation_path, browser_session)
+    logger = get_logger(session_id)
+    logger.info(f"Session {session_id} started.")
+
+    runner = AgentRunner(req.task_excel, req.conversation_path, browser_session, logger)
     runners[session_id] = runner
-    # launch agent in background
+
     asyncio.create_task(runner.run())
     return {"session": session_id}
 
@@ -160,21 +173,17 @@ async def agent_ws(ws: WebSocket, session_id: str):
     except WebSocketDisconnect:
         pass
 
+# --------- APP SERVE ---------
 async def _serve_app():
-    # Programmatically run Uvicorn server as coroutine
     config = uvicorn.Config(app=app, port=8000, reload=True)
     server = uvicorn.Server(config)
     await server.serve()
 
 if __name__ == "__main__":
-    # Use ProactorEventLoopPolicy set above for Windows
     try:
-        # Try using asyncio.run for non-Windows or simple execution
         asyncio.run(_serve_app())
     except (NotImplementedError, RuntimeError):
-        # On Windows with ProactorEventLoop, wrap loop to keep alive until serve completes
         loop = asyncio.new_event_loop()
-        print("Using ProactorEventLoopPolicy for Windows")
         asyncio.set_event_loop(loop)
         async def proactor_wrap():
             await _serve_app()
