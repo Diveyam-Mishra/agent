@@ -99,6 +99,7 @@ async def _run_agent(task_excel: str, conversation_path: str, browser_session: B
         max_actions_per_step=5,
         max_input_tokens=136000,
         sensitive_data=sensitive_data,
+        task_id="1",
         extend_system_message="""
 You are a web automation agent that follows instructions with high precision. When navigating menus or clicking sidebar items, always prefer exact text matches over partial matches.
 If multiple options have similar names, use the one that best aligns with the task intent (e.g., 'Access' vs. 'Privileged Access').
@@ -113,6 +114,7 @@ You don't have to fill every field in a form—only the ones shown or required.
 """,
 
     )
+    
     result = await agent.run()
     await agent.close()
     return result
@@ -160,7 +162,7 @@ async def agent_ws(ws: WebSocket, session_id: str):
 
 async def _serve_app():
     # Programmatically run Uvicorn server as coroutine
-    config = uvicorn.Config(app=app, host="0.0.0.0", port=8000, reload=True)
+    config = uvicorn.Config(app=app, port=8000, reload=True)
     server = uvicorn.Server(config)
     await server.serve()
 
