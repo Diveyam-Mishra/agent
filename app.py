@@ -7,8 +7,8 @@ from asyncio import WindowsProactorEventLoopPolicy
 import uvicorn
 
 # Import the new router from routes.py
-from routes import router as api_router
-from database import engine, Base
+from routes.router import router as api_router
+from database.connector import engine, Base
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
