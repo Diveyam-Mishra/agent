@@ -4,6 +4,6 @@ __pycache__/
 *.pyc
 convo/
 logs/
-*.db
+# *.db
 running/
 *.xlsx
